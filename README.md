@@ -142,6 +142,35 @@ class MarioNet(nn.Module):
         self.target.load_state_dict(self.online.state_dict())
 ```
 
+## 고민거리들
+- 기본 흐름은 n(=4)프레임별로 이미지를 저장해서 memory buffer에 올린 뒤, random sampling하고, 이를 CNN에 넣어 학습하는 구조인데, random말고 우선 순위를 도입하는 게 맞지 않나?
+-> e.g. 너무 못한 거랑 너무 잘한거랑 많이 뽑는게 유리할 것 같은데,,
+[유용한 approach]
+PER:
+중요한 경험을 더 자주 학습
+TD-error가 큰 샘플에 더 높은 우선순위 부여
+학습 속도와 안정성 향상
+HER:
+실패한 경험도 학습에 활용
+희귀한 성공 경험을 더 효율적으로 학습
+목표 지향적 학습에 효과적
+Episodic Memory:
+연속된 경험을 보존
+시퀀스 학습에 효과적
+장기 의존성 학습 가능
+Multi-step Learning:
+장기적 보상 신호 전파
+학습 속도 향상
+더 정확한 가치 추정
+
+- 오래 걸리니 multi-processing 해야하는데, 어떠한 전략이 나을지
+1. 최대한 넓은(다양한) 범위의 정답을 찾는게 나은 거라면, 동시에 돌리는 네트워크 간 sync를 하지 않는게 나은가?
+2. 빠르게 좋은 모델을 얻고 싶다면, 일정 주기, 혹은 트리거 조건으로 동기화시켜 빠르게 수렴시키는게 나을려나? 1보다는 local optima에 빠질 위험이 많지만,,, 수렴은 훨씬 빨리 하겠지,,
+
+- State based approach vs Policy based 
+찾아보니, 현재 프로젝트처럼 action이 적거나 discrete한 경우에는 state-based가 낫다는 말도,,
+-> E-greedy vs PPO??? 이렇게 가는 건가.
+
 ## 참고 자료
 - [혁펜하임 강화학습 이론](https://youtu.be/cvctS4xWSaU?si=PpxgYrUgy-XQykK-)
 - [PPO 논문](https://arxiv.org/abs/1707.06347)
