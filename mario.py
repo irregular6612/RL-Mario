@@ -1,13 +1,12 @@
 import torch
 from torch import nn
-from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms as T
+from torch.utils.tensorboard import SummaryWriter
 from PIL import Image
 import numpy as np
 from pathlib import Path
 from collections import deque
 import random, datetime, time, os
-import matplotlib.pyplot as plt
 
 # Gym은 강화학습을 위한 OpenAI 툴킷입니다.
 import gym
@@ -22,10 +21,10 @@ import gym_super_mario_bros
 
 from tensordict import TensorDict
 from torchrl.data import TensorDictReplayBuffer, LazyMemmapStorage
-import gc
+from tqdm import tqdm
 
-import torch.multiprocessing as mp
-from torch.multiprocessing import Process, Queue
+import matplotlib.pyplot as plt
+import gc
 
 
 class SkipFrame(gym.Wrapper):
@@ -37,7 +36,7 @@ class SkipFrame(gym.Wrapper):
     def step(self, action):
         """행동을 반복하고 포상을 더합니다."""
         total_reward = 0.0
-        for i in range(self._skip):
+        for _ in range(self._skip):
             # 포상을 누적하고 동일한 작업을 반복합니다.
             obs, reward, done, trunk, info = self.env.step(action)
             total_reward += reward
@@ -50,7 +49,8 @@ class GrayScaleObservation(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
         obs_shape = self.observation_space.shape[:2]
-        self.observation_space = Box(low=0, high=255, shape=obs_shape, dtype=np.uint8)
+        # dtype: uint8 -> float32: 수렴성을 위해?
+        self.observation_space = Box(low=0, high=1, shape=obs_shape, dtype=np.float32)
 
     def permute_orientation(self, observation):
         # [H, W, C] 배열을 [C, H, W] 텐서로 바꿉니다.
@@ -60,8 +60,11 @@ class GrayScaleObservation(gym.ObservationWrapper):
 
     def observation(self, observation):
         observation = self.permute_orientation(observation)
-        transform = T.Grayscale()
+        transform = T.Compose([
+            T.Grayscale(),
+        ])
         observation = transform(observation)
+        observation /= 255.0 # Normalize 0~255 -> 0~1
         return observation
 
 
@@ -74,15 +77,14 @@ class ResizeObservation(gym.ObservationWrapper):
             self.shape = tuple(shape)
 
         obs_shape = self.shape + self.observation_space.shape[2:]
-        self.observation_space = Box(low=0, high=255, shape=obs_shape, dtype=np.uint8)
+        self.observation_space = Box(low=0, high=1, shape=obs_shape, dtype=np.float32)
 
     def observation(self, observation):
         transforms = T.Compose(
-            [T.Resize(self.shape, antialias=True), T.Normalize(0, 255)]
+            [T.Resize(self.shape, antialias=True), T.Normalize(0, 1)]
         )
         observation = transforms(observation).squeeze(0)
         return observation
-
 
 class Mario:
     def __init__(self, state_dim, action_dim, save_dir):
@@ -90,10 +92,10 @@ class Mario:
         self.action_dim = action_dim
         self.save_dir = save_dir
 
-        if torch.backends.mps.is_available():
-            self.device = "mps"
-        elif torch.cuda.is_available():
+        if torch.cuda.is_available():
             self.device = "cuda"
+        elif torch.backends.mps.is_available():
+            self.device = "mps"
         else:
             self.device = "cpu"
 
@@ -102,22 +104,21 @@ class Mario:
         self.net = self.net.to(device=self.device)
 
         self.exploration_rate = 1
-        self.exploration_rate_decay = 0.99999
-        #self.exploration_rate_decay = 0.999
+        self.exploration_rate_decay = 0.99999975
         self.exploration_rate_min = 0.1
         self.curr_step = 0
 
-        self.save_every = 5e4  # Mario Net 저장 사이의 경험 횟수
+        self.save_every = 5e5  # Mario Net 저장 사이의 경험 횟수
 
     def act(self, state):
         """
-    주어진 상태에서, 입실론-그리디 행동(epsilon-greedy action)을 선택하고, 스텝의 값을 업데이트 합니다.
+        주어진 상태에서, 입실론-그리디 행동(epsilon-greedy action)을 선택하고, 스텝의 값을 업데이트 합니다.
 
-    입력값:
-    state (``LazyFrame``): 현재 상태에서의 단일 상태(observation)값을 말합니다. 차원은 (state_dim)입니다.
-    출력값:
-    ``action_idx`` (int): Mario가 수행할 행동을 나타내는 정수 값입니다.
-    """
+        입력값:
+        state (``LazyFrame``): 현재 상태에서의 단일 상태(observation)값을 말합니다. 차원은 (state_dim)입니다.
+        출력값:
+        ``action_idx`` (int): Mario가 수행할 행동을 나타내는 정수 값입니다.
+        """
         # 임의의 행동을 선택하기
         if np.random.rand() < self.exploration_rate:
             action_idx = np.random.randint(self.action_dim)
@@ -125,7 +126,8 @@ class Mario:
         # 최적의 행동을 이용하기
         else:
             state = state[0].__array__() if isinstance(state, tuple) else state.__array__()
-            state = torch.tensor(state, device=self.device, dtype=torch.float32).unsqueeze(0)
+            state = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+            state /= 255.0 # Normalize 0~255 -> 0~1
             action_values = self.net(state, model="online")
             action_idx = torch.argmax(action_values, axis=1).item()
 
@@ -137,47 +139,6 @@ class Mario:
         self.curr_step += 1
         return action_idx
 
-#===================
-#User defined reward function
-def calculate_reward(reward, info, done, prev_info=None):
-    total_reward = reward * 0.1  # 기본 보상 스케일 조정
-    
-    # 목표 달성 보너스
-    if info["flag_get"]:
-        total_reward += 1000  # 깃발 획득 보너스
-    
-    # 코인 획득 보너스
-    if prev_info and info["coins"] > prev_info["coins"]:
-        total_reward += 50  # 코인당 50점 보너스
-    
-    # 생존 보너스
-    if not done:
-        total_reward += 1.0  # 매 프레임마다 1점 보너스
-    
-    # 진행도 보너스
-    if prev_info and info["x_pos"] > prev_info["x_pos"]:
-        total_reward += 10  # 오른쪽으로 진행할 때마다 10점 보너스
-    
-    # 생명 감소 패널티
-    if prev_info and info["life"] < prev_info["life"]:
-        total_reward -= 200  # 생명 감소시 200점 패널티
-    
-    # 추가 보상
-    if prev_info:
-        # 높이 증가 보너스
-        if info["y_pos"] < prev_info["y_pos"]:  # 위로 올라갈 때
-            total_reward += 5
-        
-        # 속도 보너스
-        if info["x_pos"] - prev_info["x_pos"] > 5:  # 빠른 이동
-            total_reward += 15
-    
-    # 보상 클리핑
-    total_reward = np.clip(total_reward, -1000, 1000)
-    
-    return total_reward
-
-
 class Mario(Mario):  # 연속성을 위한 하위 클래스입니다.
     def __init__(self, state_dim, action_dim, save_dir):
         super().__init__(state_dim, action_dim, save_dir)
@@ -185,7 +146,6 @@ class Mario(Mario):  # 연속성을 위한 하위 클래스입니다.
         self.batch_size = 32
         self.prev_info = None
 
-    
     def cache(self, state, next_state, action, reward, done, info):
         """
         Store the experience to self.memory (replay buffer)
@@ -197,8 +157,9 @@ class Mario(Mario):  # 연속성을 위한 하위 클래스입니다.
         reward (``float``),
         done(``bool``))
         """
+
         # 리워드 계산
-        reward = calculate_reward(reward, info, done, self.prev_info)
+        reward = self.calculate_reward(reward, info, done, self.prev_info)
         self.prev_info = info.copy()
         
         # 기존 캐시 로직
@@ -213,14 +174,8 @@ class Mario(Mario):  # 연속성을 위한 하위 클래스입니다.
         reward = torch.tensor([reward], dtype=torch.float32)
         done = torch.tensor([done])
 
-        self.memory.add(TensorDict({
-            "state": state, 
-            "next_state": next_state, 
-            "action": action, 
-            "reward": reward, 
-            "done": done
-        }, batch_size=[]))
-
+        # self.memory.append((state, next_state, action, reward, done,))
+        self.memory.add(TensorDict({"state": state, "next_state": next_state, "action": action, "reward": reward, "done": done}, batch_size=[]))
 
     def recall(self):
         """
@@ -244,16 +199,16 @@ class MarioNet(nn.Module):
         if w != 84:
             raise ValueError(f"Expecting input width: 84, got: {w}")
 
-        self.online = self.__build_cnn(c, output_dim).float()
+        self.online = self.__build_cnn(c, output_dim)
 
-        self.target = self.__build_cnn(c, output_dim).float()
+        self.target = self.__build_cnn(c, output_dim)
         self.target.load_state_dict(self.online.state_dict())
 
         # Q_target 매개변수 값은 고정시킵니다.
         for p in self.target.parameters():
             p.requires_grad = False
 
-    def forward(self, input, model):
+    def forward(self, input, model="online"):
         if model == "online":
             return self.online(input)
         elif model == "target":
@@ -279,8 +234,68 @@ class MarioNet(nn.Module):
 class Mario(Mario):
     def __init__(self, state_dim, action_dim, save_dir):
         super().__init__(state_dim, action_dim, save_dir)
-        # discount_factor <- greedy 하게 해도 충분히 좋지 않을까? 당장 안 죽는게 더 중요하잖아.
-        self.gamma = 0.7
+        self.gamma = 0.9
+        self.reward_scale = 0.1  # 보상 스케일링 파라미터
+        self.q_scale = 1.0      # Q값 스케일링 파라미터
+        
+        # 보상 정규화를 위한 통계
+        self.reward_mean = 0
+        self.reward_std = 1
+        self.reward_count = 0
+        
+        # Q값 정규화를 위한 통계
+        self.q_mean = 0
+        self.q_std = 1
+        self.q_count = 0
+    
+    def update_statistics(self, value, is_reward=True):
+        """온라인 통계 업데이트"""
+        if is_reward:
+            self.reward_count += 1
+            delta = value - self.reward_mean
+            self.reward_mean += delta / self.reward_count
+            delta2 = value - self.reward_mean
+            self.reward_std += delta * delta2
+        else:
+            self.q_count += 1
+            delta = value - self.q_mean
+            self.q_mean += delta / self.q_count
+            delta2 = value - self.q_mean
+            self.q_std += delta * delta2
+
+    def normalize_value(self, value, is_reward=True):
+        """값 정규화"""
+        if is_reward:
+            return (value - self.reward_mean) / (self.reward_std + 1e-8)
+        else:
+            return (value - self.q_mean) / (self.q_std + 1e-8)
+
+    def calculate_reward(self, reward, info, done, prev_info=None):
+        """보상 계산 및 스케일링"""
+        total_reward = reward * self.reward_scale
+        
+        if info["flag_get"]:    # 정복
+            total_reward += 10000.0
+        if prev_info and info["coins"] > prev_info["coins"]:    # 코인 획득
+            total_reward += 100.0
+        if not done:    # 진행도
+            total_reward += 1.0
+        if prev_info and info["x_pos"] > prev_info["x_pos"]:    # 진행도 보너스
+            total_reward += 10.0
+        if prev_info and info["x_pos"] <= prev_info["x_pos"]:    # 진행도 감점
+            total_reward -= 10.0
+        if prev_info and info["life"] < prev_info["life"]:    # 생명 감소시 200점 패널티
+            total_reward -= 200.0
+        if prev_info and info["y_pos"] < prev_info["y_pos"]:  # 위로 올라갈 때
+            total_reward += 5.0
+        if prev_info and info["x_pos"] - prev_info["x_pos"] > 5:  # 빠른 이동
+            total_reward += 15.0
+        # 보상 정규화
+        normalized_reward = self.normalize_value(total_reward, is_reward=True)
+        self.update_statistics(total_reward, is_reward=True)
+        
+        return normalized_reward
+
 
     def td_estimate(self, state, action):
         current_Q = self.net(state, model="online")[
@@ -295,7 +310,14 @@ class Mario(Mario):
         next_Q = self.net(next_state, model="target")[
             np.arange(0, self.batch_size), best_action
         ]
-        return (reward + (1 - done.float()) * self.gamma * next_Q).float()
+        
+        # 정규화된 값으로 TD 타겟 계산
+        normalized_Q = self.normalize_value(next_Q, is_reward=False)
+
+        #td_target = (reward + (1 - done.float()) * self.gamma * next_Q).float()
+        td_target = (reward + (1 - done.float()) * self.gamma * normalized_Q).float()
+        
+        return td_target
 
 class Mario(Mario):
     def __init__(self, state_dim, action_dim, save_dir):
@@ -314,33 +336,58 @@ class Mario(Mario):
         self.net.target.load_state_dict(self.net.online.state_dict())
 
 class Mario(Mario):
+    def __init__(self, state_dim, action_dim, save_dir):
+        super().__init__(state_dim, action_dim, save_dir)
+        self.best_reward = float('-inf')
+        self.success_count = 0
+        self.save_conditions = {
+            'performance': False,  # 성능 기반 저장
+            'stability': False,    # 안정성 기반 저장
+            'periodic': False      # 주기적 저장
+        }
+    
     def save(self):
-        if self.curr_step % self.save_every == 0:
-            # 이전 체크포인트 삭제
-            for old_checkpoint in self.save_dir.glob("mario_net_*.chkpt"):
-                if old_checkpoint != self.save_dir / f"mario_net_{int(self.curr_step // self.save_every)}.chkpt":
-                    old_checkpoint.unlink()
+        current_reward = np.mean(self.ep_rewards[-10:])
         
-            # 새로운 체크포인트 저장
-            save_path = self.save_dir / f"mario_net_{int(self.curr_step // self.save_every)}.chkpt"
-            torch.save(
-                dict(model=self.net.state_dict(), exploration_rate=self.exploration_rate),
-                save_path,
-            )
-            print(f"MarioNet saved to {save_path} at step {self.curr_step}")
+        # 성능 기반 저장
+        if current_reward > self.best_reward:
+            self.best_reward = current_reward
+            self.save_conditions['performance'] = True
+        
+        # 안정성 기반 저장
+        if self.info["flag_get"]:
+            self.success_count += 1
+            if self.success_count >= 5:
+                self.save_conditions['stability'] = True
+        
+        # 주기적 저장
+        if self.curr_step % self.save_every == 0:
+            self.save_conditions['periodic'] = True
+        
+        # 저장 조건 충족 시 저장
+        if any(self.save_conditions.values()):
+            save_path = self.save_dir / f"mario_net_{self.curr_step}.chkpt"
+            torch.save({
+                'model': self.net.state_dict(),
+                'exploration_rate': self.exploration_rate,
+                'best_reward': self.best_reward,
+                'success_count': self.success_count,
+                'save_conditions': self.save_conditions
+            }, save_path)
+            
+            # 조건 초기화
+            self.save_conditions = {k: False for k in self.save_conditions}
 
 class Mario(Mario):
     def __init__(self, state_dim, action_dim, save_dir):
         super().__init__(state_dim, action_dim, save_dir)
-        self.burnin = 1e4  # 학습을 진행하기 전 최소한의 경험값.
-        self.learn_every = 3  # Q_online 업데이트 사이의 경험 횟수.
-        self.sync_every = 1e4  # Q_target과 Q_online sync 사이의 경험 수
+        self.burnin = 1e3  # 학습을 진행하기 전 최소한의 경험값. 1e4 -> 1e3 학습을 더 빠르게 시작.
+        self.learn_every = 1  # Q_online 업데이트 사이의 경험 횟수. 매번 학습 3 -> 1
+        self.sync_every = 1e3  # Q_target과 Q_online sync 사이의 경험 수 1e4 -> 1e3
 
     def learn(self):
         if self.curr_step % self.sync_every == 0:
             self.sync_Q_target()
-            torch.mps.empty_cache() if torch.backends.mps.is_available() else None
-            gc.collect()
 
         if self.curr_step % self.save_every == 0:
             self.save()
@@ -366,20 +413,37 @@ class Mario(Mario):
         return (td_est.mean().item(), loss)
 
 
-
 class MetricLogger:
-    def __init__(self, save_dir):
+    def __init__(self, save_dir, model=None, device=None):
         self.save_log = save_dir / "log"
+        self.writer = SummaryWriter(os.path.join(save_dir, "tensorboard"))
+
+        self.max_history_length = 1000  # 최대 저장할 에피소드 수
+        self.cleanup_interval = 100     # 몇 에피소드마다 정리할지
+        self.last_cleanup = 0           # 마지막 정리 시점
+
+        # model 기록
+        if model is None:
+            raise ValueError("model is required")
+        
+        dummy_input = torch.zeros((1, 4, 84, 84)).to(device)
+        self.writer.add_graph(model, dummy_input)  # 모델 구조 기록
+        # 모델 파라미터 수 계산 및 기록
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        self.writer.add_text('Model/Parameters', f'Total Parameters: {total_params:,}\nTrainable Parameters: {trainable_params:,}')
+        
+        # 각 레이어의 파라미터 수 기록
+        for name, param in model.named_parameters():
+            self.writer.add_text('Model/Layers', f'{name}: {param.numel():,} parameters')
+        
+
         with open(self.save_log, "w") as f:
             f.write(
                 f"{'Episode':>8}{'Step':>8}{'Epsilon':>10}{'MeanReward':>15}"
                 f"{'MeanLength':>15}{'MeanLoss':>15}{'MeanQValue':>15}"
                 f"{'TimeDelta':>15}{'Time':>20}\n"
             )
-
-         # 텐서보드 writer 초기화
-        self.writer = SummaryWriter(log_dir=str(save_dir / "tensorboard"))
-        
         self.ep_rewards_plot = save_dir / "reward_plot.jpg"
         self.ep_lengths_plot = save_dir / "length_plot.jpg"
         self.ep_avg_losses_plot = save_dir / "loss_plot.jpg"
@@ -397,38 +461,11 @@ class MetricLogger:
         self.moving_avg_ep_avg_losses = []
         self.moving_avg_ep_avg_qs = []
 
-        # 메모리 관리 설정
-        self.max_history_length = 1000  # 최대 저장할 에피소드 수
-        self.cleanup_interval = 100     # 몇 에피소드마다 정리할지
-        self.last_cleanup = 0           # 마지막 정리 시점
-
         # 현재 에피스드에 대한 지표를 기록합니다.
         self.init_episode()
 
         # 시간에 대한 기록입니다.
         self.record_time = time.time()
-
-    def cleanup_old_data(self, current_episode):
-        """오래된 데이터 정리"""
-        if current_episode - self.last_cleanup >= self.cleanup_interval:
-            # 이동 평균 데이터는 유지하고 나머지 데이터 정리
-            if len(self.ep_rewards) > self.max_history_length:
-                self.ep_rewards = self.ep_rewards[-self.max_history_length:]
-            if len(self.ep_lengths) > self.max_history_length:
-                self.ep_lengths = self.ep_lengths[-self.max_history_length:]
-            if len(self.ep_avg_losses) > self.max_history_length:
-                self.ep_avg_losses = self.ep_avg_losses[-self.max_history_length:]
-            if len(self.ep_avg_qs) > self.max_history_length:
-                self.ep_avg_qs = self.ep_avg_qs[-self.max_history_length:]
-            
-            # 메모리 정리
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            self.last_cleanup = current_episode
-            print(f"Memory cleanup performed at episode {current_episode}")
-
 
     def log_step(self, reward, loss, q):
         self.curr_ep_reward += reward
@@ -460,27 +497,33 @@ class MetricLogger:
         self.curr_ep_q = 0.0
         self.curr_ep_loss_length = 0
 
-    def record(self, episode, epsilon, step):
-        # 메모리 정리 수행
+    def record(self, episode, epsilon, step, model=None):
         self.cleanup_old_data(episode)
 
         mean_ep_reward = np.round(np.mean(self.ep_rewards[-100:]), 3)
         mean_ep_length = np.round(np.mean(self.ep_lengths[-100:]), 3)
         mean_ep_loss = np.round(np.mean(self.ep_avg_losses[-100:]), 3)
         mean_ep_q = np.round(np.mean(self.ep_avg_qs[-100:]), 3)
+        
+        self.moving_avg_ep_rewards.append(mean_ep_reward)
+        self.moving_avg_ep_lengths.append(mean_ep_length)
+        self.moving_avg_ep_avg_losses.append(mean_ep_loss)
+        self.moving_avg_ep_avg_qs.append(mean_ep_q)
 
-        # 텐서보드에 기록
+        # tensorboard에 기록
         self.writer.add_scalar('Metrics/Mean Reward', mean_ep_reward, episode)
         self.writer.add_scalar('Metrics/Mean Length', mean_ep_length, episode)
         self.writer.add_scalar('Metrics/Mean Loss', mean_ep_loss, episode)
         self.writer.add_scalar('Metrics/Mean Q Value', mean_ep_q, episode)
         self.writer.add_scalar('Metrics/Epsilon', epsilon, episode)
-        
-        # 이동 평균
-        self.moving_avg_ep_rewards.append(mean_ep_reward)
-        self.moving_avg_ep_lengths.append(mean_ep_length)
-        self.moving_avg_ep_avg_losses.append(mean_ep_loss)
-        self.moving_avg_ep_avg_qs.append(mean_ep_q)
+        self.writer.add_scalar('Metrics/Step', step, episode)
+
+        # 모델 파라미터의 그래디언트와 가중치 분포 기록
+        if model is not None:
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    self.writer.add_histogram(f'Gradients/{name}', param.grad, episode)
+                self.writer.add_histogram(f'Weights/{name}', param.data, episode)    
 
         last_record_time = self.record_time
         self.record_time = time.time()
@@ -511,152 +554,99 @@ class MetricLogger:
             plt.plot(getattr(self, f"moving_avg_{metric}"), label=f"moving_avg_{metric}")
             plt.legend()
             plt.savefig(getattr(self, f"{metric}_plot"))
+            self.writer.add_figure(f'Plots/{metric}', plt.gcf(), episode)
+    
+    def cleanup_old_data(self, current_episode):
+        """오래된 데이터 정리"""
+        if current_episode - self.last_cleanup >= self.cleanup_interval:
+            # 이동 평균 데이터는 유지하고 나머지 데이터 정리
+            if len(self.ep_rewards) > self.max_history_length:
+                self.ep_rewards = self.ep_rewards[-self.max_history_length:]
+            if len(self.ep_lengths) > self.max_history_length:
+                self.ep_lengths = self.ep_lengths[-self.max_history_length:]
+            if len(self.ep_avg_losses) > self.max_history_length:
+                self.ep_avg_losses = self.ep_avg_losses[-self.max_history_length:]
+            if len(self.ep_avg_qs) > self.max_history_length:
+                self.ep_avg_qs = self.ep_avg_qs[-self.max_history_length:]
+            
+            # 메모리 정리
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            self.last_cleanup = current_episode
     def close(self):
         self.writer.close()
-        # 마지막 메모리 정리
-        gc.collect()
-        if torch.backends.mps.is_available():
-            torch.backends.mps.empty_cache()
 
-
-
-class ParallelEnv:
-    def __init__(self, num_envs=4):
-        self.num_envs = num_envs
-        self.envs = []
-        self.queues = []
-        
-        for _ in range(num_envs):
-            env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0", render_mode='human', apply_api_compatibility=True)
-            env = JoypadSpace(env, [["right"], ["right", "A"], ["A"]])
-            env = SkipFrame(env, skip=4)
-            env = GrayScaleObservation(env)
-            env = ResizeObservation(env, shape=84)
-            env = FrameStack(env, num_stack=4)
-            self.envs.append(env)
-            self.queues.append(Queue())
-    
-    def reset(self):
-        states = []
-        for env in self.envs:
-            state = env.reset()
-            states.append(state)
-        return states
-    
-    def step(self, actions):
-        states = []
-        rewards = []
-        dones = []
-        infos = []
-        
-        for i, (env, action) in enumerate(zip(self.envs, actions)):
-            state, reward, done, trunc, info = env.step(action)
-            states.append(state)
-            rewards.append(reward)
-            dones.append(done)
-            infos.append(info)
-            
-            if done:
-                state = env.reset()
-                states[i] = state
-        
-        return states, rewards, dones, infos
-
-
-def train_worker(worker_id, shared_memory, num_episodes):
-    # 각 워커별 환경 초기화
-    env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0", render_mode='human', apply_api_compatibility=True)
-    env = JoypadSpace(env, [["right"], ["right", "A"], ["A"]])
-    env = SkipFrame(env, skip=4)
-    env = GrayScaleObservation(env)
-    env = ResizeObservation(env, shape=84)
-    env = FrameStack(env, num_stack=4)
-    
-    # 에이전트 초기화
-    mario = Mario(state_dim=(4, 84, 84), action_dim=env.action_space.n, save_dir=Path("checkpoints"))
-    mario.net = mario.net.float()
-    
-    for episode in range(num_episodes):
-        state, info = env.reset()
-        episode_reward = 0
-        prev_info = info
-        
-        while True:
-            action = mario.act(state)
-            next_state, reward, done, trunc, info = env.step(action)
-
-            # 리워드 계산
-            reward = calculate_reward(reward, info, done, prev_info)
-            
-            
-            # 수정된 캐시 호출
-            mario.cache(state, next_state, action, reward, done, info)
-            
-            q, loss = mario.learn()
-            
-            episode_reward += reward
-            state = next_state
-            prev_info = info
-            
-            if done or info["flag_get"]:
-                break
-        
-        # 공유 메모리에 결과 저장
-        shared_memory.put({
-            'worker_id': worker_id,
-            'episode': episode,
-            'reward': episode_reward,
-            'epsilon': mario.exploration_rate
-        })
 
 def main():
+    # 슈퍼 마리오 환경 초기화하기 (in v0.26 change render mode to 'human' to see results on the screen)
+    # numpy 2.0 version은 uint8에서 crash
+    if gym.__version__ < '0.26':
+        env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0", new_step_api=True)
+    else:
+        env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0", render_mode='human', apply_api_compatibility=True)
 
-     # 메인 환경 초기화
-    env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0", render_mode='human', apply_api_compatibility=True)
-    env = JoypadSpace(env, [["right"], ["right", "A"], ["A"]])
+    # 상태 공간을 2가지로 제한하기
+    #   0. 오른쪽으로 걷기
+    #   1. 오른쪽으로 점프하기
+    env = JoypadSpace(env, [["right"], ["right", "A"]])
+
+    # 래퍼를 환경에 적용합니다.
     env = SkipFrame(env, skip=4)
     env = GrayScaleObservation(env)
     env = ResizeObservation(env, shape=84)
-    env = FrameStack(env, num_stack=4)
+    if gym.__version__ < '0.26':
+        env = FrameStack(env, num_stack=4, new_step_api=True)
+    else:
+        env = FrameStack(env, num_stack=4)
 
-    num_workers = 4  # 병렬로 실행할 워커 수
-    num_episodes = 10000  # 각 워커당 에피소드 수
-    
-    # 공유 메모리 초기화
-    shared_memory = Queue(maxsize=1000)
-    
-    # 워커 프로세스 생성
-    processes = []
-    for i in range(num_workers):
-        p = Process(target=train_worker, args=(i, shared_memory, num_episodes))
-        p.start()
-        processes.append(p)
-    
-    # 메인 에이전트 초기화
-    mario = Mario(state_dim=(4, 84, 84), action_dim=env.action_space.n, save_dir=Path("checkpoints"))
-    logger = MetricLogger(save_dir=Path("checkpoints"))
-    
-    # 결과 수집 및 로깅
-    total_episodes = 0
-    while total_episodes < num_workers * num_episodes:
-        result = shared_memory.get()
+    use_cuda = torch.cuda.is_available()
+    use_mps = torch.backends.mps.is_available()
+    print(f"CUDA-available: {use_cuda}, MPS-available: {use_mps}")
+
+    save_dir = Path("checkpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    save_dir.mkdir(parents=True)
+
+    mario = Mario(state_dim=(4, 84, 84), action_dim=env.action_space.n, save_dir=save_dir)
+
+    logger = MetricLogger(save_dir, model = mario.net, device = mario.device)
+
+    episodes = 10000
+    for e in range(episodes):
+
+        state = env.reset()
+
+        # 게임을 실행시켜봅시다!
+        while True:
+
+            # 현재 상태에서 에이전트 실행하기
+            action = mario.act(state)
+
+            # 에이전트가 액션 수행하기
+            next_state, reward, done, trunc, info = env.step(action)
+
+            # 기억하기
+            mario.cache(state, next_state, action, reward, done, info)
+
+            # 배우기
+            q, loss = mario.learn()
+
+            # 기록하기
+            logger.log_step(reward, loss, q)
+
+            # 상태 업데이트하기
+            state = next_state
+
+            # 게임이 끝났는지 확인하기
+            if done or info["flag_get"]:
+                break
+
         logger.log_episode()
-        logger.record(
-            episode=result['episode'],
-            epsilon=result['epsilon'],
-            step=mario.curr_step
-        )
-        total_episodes += 1
-    
-    # 프로세스 종료
-    for p in processes:
-        p.join()
-    
+
+        if (e % 5 == 0) or (e == episodes - 1):
+            logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step, model=mario.net)
     logger.close()
 
 if __name__ == "__main__":
-    try:
-        mp.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass  # 이미 설정되어 있는 경우 무시
     main()
