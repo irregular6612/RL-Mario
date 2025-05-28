@@ -24,6 +24,7 @@ from torchrl.data import TensorDictReplayBuffer, LazyMemmapStorage
 from tqdm import tqdm
 
 import matplotlib.pyplot as plt
+import gc
 
 
 class SkipFrame(gym.Wrapper):
@@ -141,7 +142,7 @@ class Mario:
 class Mario(Mario):  # 연속성을 위한 하위 클래스입니다.
     def __init__(self, state_dim, action_dim, save_dir):
         super().__init__(state_dim, action_dim, save_dir)
-        self.memory = TensorDictReplayBuffer(storage=LazyMemmapStorage(100000, device=torch.device("cpu")))
+        self.memory = TensorDictReplayBuffer(storage=LazyMemmapStorage(50000, device=torch.device("cpu")))
         self.batch_size = 32
         self.prev_info = None
 
@@ -274,19 +275,21 @@ class Mario(Mario):
         total_reward = reward * self.reward_scale
         
         if info["flag_get"]:    # 정복
-            total_reward += 10000
+            total_reward += 10000.0
         if prev_info and info["coins"] > prev_info["coins"]:    # 코인 획득
-            total_reward += 1000
+            total_reward += 100.0
         if not done:    # 진행도
             total_reward += 1.0
         if prev_info and info["x_pos"] > prev_info["x_pos"]:    # 진행도 보너스
-            total_reward += 10
+            total_reward += 10.0
+        if prev_info and info["x_pos"] <= prev_info["x_pos"]:    # 진행도 감점
+            total_reward -= 10.0
         if prev_info and info["life"] < prev_info["life"]:    # 생명 감소시 200점 패널티
-            total_reward -= 200
+            total_reward -= 200.0
         if prev_info and info["y_pos"] < prev_info["y_pos"]:  # 위로 올라갈 때
-            total_reward += 5
+            total_reward += 5.0
         if prev_info and info["x_pos"] - prev_info["x_pos"] > 5:  # 빠른 이동
-            total_reward += 15
+            total_reward += 15.0
         # 보상 정규화
         normalized_reward = self.normalize_value(total_reward, is_reward=True)
         self.update_statistics(total_reward, is_reward=True)
@@ -333,15 +336,47 @@ class Mario(Mario):
         self.net.target.load_state_dict(self.net.online.state_dict())
 
 class Mario(Mario):
+    def __init__(self, state_dim, action_dim, save_dir):
+        super().__init__(state_dim, action_dim, save_dir)
+        self.best_reward = float('-inf')
+        self.success_count = 0
+        self.save_conditions = {
+            'performance': False,  # 성능 기반 저장
+            'stability': False,    # 안정성 기반 저장
+            'periodic': False      # 주기적 저장
+        }
+    
     def save(self):
-        save_path = (
-            self.save_dir / f"mario_net_{int(self.curr_step // self.save_every)}.chkpt"
-        )
-        torch.save(
-            dict(model=self.net.state_dict(), exploration_rate=self.exploration_rate),
-            save_path,
-        )
-        print(f"MarioNet saved to {save_path} at step {self.curr_step}")
+        current_reward = np.mean(self.ep_rewards[-10:])
+        
+        # 성능 기반 저장
+        if current_reward > self.best_reward:
+            self.best_reward = current_reward
+            self.save_conditions['performance'] = True
+        
+        # 안정성 기반 저장
+        if self.info["flag_get"]:
+            self.success_count += 1
+            if self.success_count >= 5:
+                self.save_conditions['stability'] = True
+        
+        # 주기적 저장
+        if self.curr_step % self.save_every == 0:
+            self.save_conditions['periodic'] = True
+        
+        # 저장 조건 충족 시 저장
+        if any(self.save_conditions.values()):
+            save_path = self.save_dir / f"mario_net_{self.curr_step}.chkpt"
+            torch.save({
+                'model': self.net.state_dict(),
+                'exploration_rate': self.exploration_rate,
+                'best_reward': self.best_reward,
+                'success_count': self.success_count,
+                'save_conditions': self.save_conditions
+            }, save_path)
+            
+            # 조건 초기화
+            self.save_conditions = {k: False for k in self.save_conditions}
 
 class Mario(Mario):
     def __init__(self, state_dim, action_dim, save_dir):
@@ -382,6 +417,10 @@ class MetricLogger:
     def __init__(self, save_dir, model=None, device=None):
         self.save_log = save_dir / "log"
         self.writer = SummaryWriter(os.path.join(save_dir, "tensorboard"))
+
+        self.max_history_length = 1000  # 최대 저장할 에피소드 수
+        self.cleanup_interval = 100     # 몇 에피소드마다 정리할지
+        self.last_cleanup = 0           # 마지막 정리 시점
 
         # model 기록
         if model is None:
@@ -459,6 +498,8 @@ class MetricLogger:
         self.curr_ep_loss_length = 0
 
     def record(self, episode, epsilon, step, model=None):
+        self.cleanup_old_data(episode)
+
         mean_ep_reward = np.round(np.mean(self.ep_rewards[-100:]), 3)
         mean_ep_length = np.round(np.mean(self.ep_lengths[-100:]), 3)
         mean_ep_loss = np.round(np.mean(self.ep_avg_losses[-100:]), 3)
@@ -515,6 +556,25 @@ class MetricLogger:
             plt.savefig(getattr(self, f"{metric}_plot"))
             self.writer.add_figure(f'Plots/{metric}', plt.gcf(), episode)
     
+    def cleanup_old_data(self, current_episode):
+        """오래된 데이터 정리"""
+        if current_episode - self.last_cleanup >= self.cleanup_interval:
+            # 이동 평균 데이터는 유지하고 나머지 데이터 정리
+            if len(self.ep_rewards) > self.max_history_length:
+                self.ep_rewards = self.ep_rewards[-self.max_history_length:]
+            if len(self.ep_lengths) > self.max_history_length:
+                self.ep_lengths = self.ep_lengths[-self.max_history_length:]
+            if len(self.ep_avg_losses) > self.max_history_length:
+                self.ep_avg_losses = self.ep_avg_losses[-self.max_history_length:]
+            if len(self.ep_avg_qs) > self.max_history_length:
+                self.ep_avg_qs = self.ep_avg_qs[-self.max_history_length:]
+            
+            # 메모리 정리
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            self.last_cleanup = current_episode
     def close(self):
         self.writer.close()
 
@@ -543,8 +603,7 @@ def main():
 
     use_cuda = torch.cuda.is_available()
     use_mps = torch.backends.mps.is_available()
-    print(f"Using CUDA: {use_cuda}")
-    print(f"Using MPS: {use_mps}")
+    print(f"CUDA-available: {use_cuda}, MPS-available: {use_mps}")
 
     save_dir = Path("checkpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     save_dir.mkdir(parents=True)
