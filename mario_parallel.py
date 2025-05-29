@@ -22,15 +22,22 @@ from mario import (
 )
 
 class ParallelTrainer:
-    def __init__(self, num_workers=None, episodes_per_worker=100):
+    def __init__(self, num_workers=None, episodes_per_worker=100, performance_mode="balanced"):
         """
         병렬 학습을 위한 트레이너 클래스
         
         Args:
-            num_workers: 워커 프로세스 수 (None이면 CPU 코어 수의 80% 사용)
+            num_workers: 워커 프로세스 수 (None이면 성능 모드에 따라 자동 설정)
             episodes_per_worker: 각 워커당 실행할 에피소드 수
+            performance_mode: "balanced", "speed", "memory_safe" 중 선택
         """
-        self.num_workers = num_workers or max(1, int(mp.cpu_count() * 0.8))
+        self.performance_mode = performance_mode
+        
+        # 성능 모드에 따른 동적 워커 수 설정
+        if num_workers is None:
+            num_workers = self._get_optimal_workers()
+        
+        self.num_workers = num_workers
         self.episodes_per_worker = episodes_per_worker
         
         # 환경 설정
@@ -44,6 +51,103 @@ class ParallelTrainer:
         self.state_dim = (4, 84, 84)
         
         print(f"병렬 학습 초기화: {self.num_workers}개 워커, 워커당 {self.episodes_per_worker} 에피소드")
+        print(f"성능 모드: {self.performance_mode}")
+        print(f"CPU 코어 수: {mp.cpu_count()}, 선택된 워커 수: {self.num_workers}")
+    
+    def _get_optimal_workers(self):
+        """성능 모드와 하드웨어를 고려한 최적 워커 수 계산"""
+        cpu_count = mp.cpu_count()
+        
+        # GPU 메모리 정보 확인
+        if torch.cuda.is_available():
+            try:
+                gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                print(f"GPU 메모리: {gpu_memory_gb:.1f} GB")
+            except:
+                gpu_memory_gb = 20  # 기본값
+        else:
+            gpu_memory_gb = 0
+        
+        # 성능 모드별 워커 수 계산
+        if self.performance_mode == "speed":
+            # 속도 우선: GPU 메모리 최대 활용, 적은 워커 수
+            if gpu_memory_gb >= 20:
+                optimal_workers = 2  # GPU 메모리 집중 사용
+                print("속도 우선 모드: 2개 워커로 GPU 메모리 최대 활용")
+            else:
+                optimal_workers = 1
+                print("속도 우선 모드: GPU 메모리 부족으로 1개 워커")
+                
+        elif self.performance_mode == "memory_safe":
+            # 메모리 안전: CPU 메모리 사용, 많은 워커 수
+            if cpu_count >= 16:
+                optimal_workers = min(6, cpu_count - 2)
+            elif cpu_count >= 8:
+                optimal_workers = min(4, cpu_count - 2)
+            else:
+                optimal_workers = min(3, cpu_count - 1)
+            print(f"메모리 안전 모드: {optimal_workers}개 워커로 CPU 메모리 사용")
+            
+        else:  # balanced
+            # 균형 모드: GPU 메모리와 워커 수의 균형
+            if gpu_memory_gb >= 20:
+                if cpu_count >= 16:
+                    optimal_workers = 3  # 16 vCPU에서 균형점
+                elif cpu_count >= 8:
+                    optimal_workers = 2  # 8 vCPU에서 균형점
+                else:
+                    optimal_workers = 2  # 기본 균형점
+            else:
+                optimal_workers = min(4, cpu_count - 1)
+            print(f"균형 모드: {optimal_workers}개 워커로 GPU/CPU 메모리 혼합 사용")
+        
+        return optimal_workers
+    
+    @staticmethod
+    def get_cpu_recommendations():
+        """GCP에서 L4 GPU와 함께 사용할 수 있는 CPU 옵션별 권장 워커 수"""
+        recommendations = {
+            "현재 설정 (4 vCPU)": {
+                "machine_type": "g2-standard-4",
+                "recommended_workers": 3,  # GPU 메모리 제한 고려
+                "expected_performance": "기준 성능",
+                "cost_efficiency": "높음"
+            },
+            "업그레이드 옵션 1 (8 vCPU)": {
+                "machine_type": "g2-standard-8", 
+                "recommended_workers": 4,  # GPU 메모리 제한 고려
+                "expected_performance": "1.3-1.5배 향상",
+                "cost_efficiency": "중간"
+            },
+            "업그레이드 옵션 2 (16 vCPU)": {
+                "machine_type": "g2-standard-16",
+                "recommended_workers": 5,  # GPU 메모리 제한 고려
+                "expected_performance": "1.5-2배 향상", 
+                "cost_efficiency": "중간"
+            },
+            "고성능 옵션 (32 vCPU)": {
+                "machine_type": "g2-standard-32",
+                "recommended_workers": 6,  # GPU 메모리 제한 고려
+                "expected_performance": "2-2.5배 향상",
+                "cost_efficiency": "낮음 (고비용)"
+            }
+        }
+        
+        print("\n=== GCP L4 GPU + CPU 조합별 권장 설정 (GPU 메모리 제한 고려) ===")
+        for config_name, config in recommendations.items():
+            print(f"\n{config_name}:")
+            print(f"  - 머신 타입: {config['machine_type']}")
+            print(f"  - 권장 워커 수: {config['recommended_workers']}")
+            print(f"  - 예상 성능: {config['expected_performance']}")
+            print(f"  - 비용 효율성: {config['cost_efficiency']}")
+        
+        print(f"\n중요 사항:")
+        print(f"  - L4 GPU 메모리 제한(22GB)으로 인해 워커 수가 제한됨")
+        print(f"  - 각 워커당 약 2-3GB GPU 메모리 사용")
+        print(f"  - CPU 코어 수보다 GPU 메모리가 병목이 될 수 있음")
+        print(f"  - 권장: g2-standard-8 또는 g2-standard-16")
+        
+        return recommendations
 
     def create_environment(self):
         """마리오 환경 생성"""
@@ -79,7 +183,7 @@ class ParallelTrainer:
             save_dir: 체크포인트 저장 디렉토리
             tensorboard_dir: TensorBoard 로그 디렉토리
         """
-        print(f"워커 {worker_id}: 학습 시작")
+        print(f"워커 {worker_id}: 학습 시작 (성능 모드: {self.performance_mode})")
         
         try:
             # 환경 생성
@@ -93,11 +197,12 @@ class ParallelTrainer:
             worker_tb_dir = tensorboard_dir / f"worker_{worker_id}"
             worker_writer = SummaryWriter(log_dir=str(worker_tb_dir))
             
-            # 마리오 에이전트 생성
+            # 마리오 에이전트 생성 (성능 모드 전달)
             mario = Mario(
                 state_dim=self.state_dim,
                 action_dim=env.action_space.n,
-                save_dir=worker_save_dir
+                save_dir=worker_save_dir,
+                performance_mode=self.performance_mode  # 성능 모드 전달
             )
             
             # 모델 구조를 TensorBoard에 기록
@@ -153,6 +258,9 @@ class ParallelTrainer:
                     if done or info.get("flag_get", False):
                         break
                 
+                # 에피소드 보상을 mario.ep_rewards에 추가
+                mario.ep_rewards.append(episode_reward)
+                
                 # 에피소드별 메트릭을 TensorBoard에 기록
                 global_step = worker_id * self.episodes_per_worker + episode
                 
@@ -179,43 +287,34 @@ class ParallelTrainer:
                     worker_writer.add_scalar('Game/Life', int(info.get('life', 0)), global_step)
                     worker_writer.add_scalar('Game/FlagGet', int(info.get('flag_get', False)), global_step)
                     
-                    # 모델 파라미터와 그래디언트 상세 분석 (매 에피소드마다)
-                    total_grad_norm = 0.0
-                    total_param_norm = 0.0
-                    layer_count = 0
-                    
-                    for name, param in mario.net.named_parameters():
-                        if param.requires_grad:
-                            # 파라미터 통계
-                            param_data = param.data.cpu()
-                            worker_writer.add_scalar(f'Parameters/{name}/Mean', float(param_data.mean()), global_step)
-                            worker_writer.add_scalar(f'Parameters/{name}/Std', float(param_data.std()), global_step)
-                            worker_writer.add_scalar(f'Parameters/{name}/Min', float(param_data.min()), global_step)
-                            worker_writer.add_scalar(f'Parameters/{name}/Max', float(param_data.max()), global_step)
-                            worker_writer.add_scalar(f'Parameters/{name}/Norm', float(param_data.norm()), global_step)
-                            
-                            total_param_norm += param_data.norm().item() ** 2
-                            
-                            # 그래디언트 통계 (그래디언트가 있는 경우)
-                            if param.grad is not None:
-                                grad_data = param.grad.cpu()
-                                worker_writer.add_scalar(f'Gradients/{name}/Mean', float(grad_data.mean()), global_step)
-                                worker_writer.add_scalar(f'Gradients/{name}/Std', float(grad_data.std()), global_step)
-                                worker_writer.add_scalar(f'Gradients/{name}/Min', float(grad_data.min()), global_step)
-                                worker_writer.add_scalar(f'Gradients/{name}/Max', float(grad_data.max()), global_step)
-                                worker_writer.add_scalar(f'Gradients/{name}/Norm', float(grad_data.norm()), global_step)
+                    # 모델 파라미터와 그래디언트 상세 분석 (10 에피소드마다로 변경)
+                    if episode % 10 == 0:
+                        total_grad_norm = 0.0
+                        total_param_norm = 0.0
+                        layer_count = 0
+                        
+                        for name, param in mario.net.named_parameters():
+                            if param.requires_grad:
+                                # 파라미터 통계 (GPU에서 직접 계산)
+                                param_norm = float(param.data.norm())
+                                worker_writer.add_scalar(f'Parameters/{name}/Norm', param_norm, global_step)
+                                total_param_norm += param_norm ** 2
                                 
-                                total_grad_norm += grad_data.norm().item() ** 2
-                            
-                            layer_count += 1
+                                # 그래디언트 통계 (그래디언트가 있는 경우)
+                                if param.grad is not None:
+                                    grad_norm = float(param.grad.norm())
+                                    worker_writer.add_scalar(f'Gradients/{name}/Norm', grad_norm, global_step)
+                                    total_grad_norm += grad_norm ** 2
+                                
+                                layer_count += 1
+                        
+                        # 전체 그래디언트 및 파라미터 노름
+                        worker_writer.add_scalar('Model/TotalGradientNorm', float(total_grad_norm ** 0.5), global_step)
+                        worker_writer.add_scalar('Model/TotalParameterNorm', float(total_param_norm ** 0.5), global_step)
+                        worker_writer.add_scalar('Model/LayerCount', layer_count, global_step)
                     
-                    # 전체 그래디언트 및 파라미터 노름
-                    worker_writer.add_scalar('Model/TotalGradientNorm', float(total_grad_norm ** 0.5), global_step)
-                    worker_writer.add_scalar('Model/TotalParameterNorm', float(total_param_norm ** 0.5), global_step)
-                    worker_writer.add_scalar('Model/LayerCount', layer_count, global_step)
-                    
-                    # 모델 파라미터 히스토그램 기록 (5 에피소드마다)
-                    if episode % 5 == 0:
+                    # 모델 파라미터 히스토그램 기록 (20 에피소드마다로 변경)
+                    if episode % 20 == 0:
                         for name, param in mario.net.named_parameters():
                             if param.grad is not None:
                                 worker_writer.add_histogram(f'Gradients/{name}', param.grad.cpu(), global_step)
@@ -304,10 +403,18 @@ class ParallelTrainer:
             print(f"워커 {worker_id} 오류: {e}")
             import traceback
             traceback.print_exc()
-            result_queue.put({
-                'worker_id': worker_id,
-                'error': str(e)
-            })
+            
+            # 오류 정보를 큐에 전송
+            try:
+                result_queue.put({
+                    'worker_id': worker_id,
+                    'error': str(e),
+                    'error_type': type(e).__name__,
+                    'completed_episodes': episode if 'episode' in locals() else 0,
+                    'traceback': traceback.format_exc()
+                })
+            except Exception as queue_error:
+                print(f"워커 {worker_id}: 오류 정보 전송 실패 - {queue_error}")
 
     def train(self):
         """병렬 학습 실행"""
@@ -348,19 +455,19 @@ class ParallelTrainer:
             target_params = sum(p.numel() for p in dummy_mario.net.target.parameters())
             
             model_info = f"""
-# 모델 구조 정보
+                    ## 모델 구조 정보
 
-## 전체 네트워크
-- **총 파라미터 수**: {total_params:,}
-- **학습 가능한 파라미터 수**: {trainable_params:,}
-- **고정된 파라미터 수**: {total_params - trainable_params:,}
+                    ### 전체 네트워크 파라미터 수        
+                        - **총 파라미터 수**: {total_params:,}
+                        - **학습 가능한 파라미터 수**: {trainable_params:,}
+                        - **고정된 파라미터 수**: {total_params - trainable_params:,}
 
-## 네트워크 구성
-- **온라인 네트워크 파라미터**: {online_params:,}
-- **타겟 네트워크 파라미터**: {target_params:,}
+                    ## 네트워크 구성
+                    - **온라인 네트워크 파라미터**: {online_params:,}
+                    - **타겟 네트워크 파라미터**: {target_params:,}
 
-## 레이어별 파라미터 수
-"""
+                    ## 레이어별 파라미터 수
+                    """
             
             # 레이어별 파라미터 수 계산
             for name, param in dummy_mario.net.named_parameters():
@@ -431,12 +538,14 @@ class ParallelTrainer:
         
         while completed_episodes < total_episodes:
             try:
-                # 결과 대기 (타임아웃 60초)
-                result = result_queue.get(timeout=60)
+                # 결과 대기 (타임아웃 120초로 증가)
+                result = result_queue.get(timeout=120)
                 
                 # 오류 처리
                 if 'error' in result:
                     print(f"워커 {result['worker_id']} 오류: {result['error']}")
+                    # 오류가 발생한 워커의 에피소드 수를 차감하여 무한 대기 방지
+                    total_episodes -= (self.episodes_per_worker - result.get('completed_episodes', 0))
                     continue
                 
                 # 메인 TensorBoard에 통합 메트릭 기록
@@ -510,10 +619,28 @@ class ParallelTrainer:
                 
             except Exception as e:
                 print(f"결과 수집 중 오류: {e}")
+                print(f"오류 타입: {type(e).__name__}")
+                import traceback
+                traceback.print_exc()
+                
                 # 프로세스 상태 확인
                 alive_processes = [p.is_alive() for p in processes]
+                print(f"살아있는 프로세스: {sum(alive_processes)}/{len(processes)}")
+                
                 if not any(alive_processes):
                     print("모든 워커 프로세스가 종료됨")
+                    break
+                
+                # 큐가 비어있는지 확인
+                try:
+                    queue_size = result_queue.qsize()
+                    print(f"큐 크기: {queue_size}")
+                except:
+                    print("큐 크기 확인 불가")
+                
+                # 타임아웃이 계속 발생하면 중단
+                if "timeout" in str(e).lower():
+                    print("타임아웃이 계속 발생하여 학습을 중단합니다.")
                     break
         
         # 프로세스 정리
@@ -553,16 +680,38 @@ class ParallelTrainer:
 
 def main():
     """메인 함수"""
+    # PyTorch CUDA 메모리 관리 최적화
+    import os
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    
     # multiprocessing 설정
     try:
         mp.set_start_method('spawn', force=True)
     except RuntimeError:
         pass  # 이미 설정된 경우 무시
     
+    # CPU 권장사항 출력
+    ParallelTrainer.get_cpu_recommendations()
+    
+    print("\n=== 성능 모드 선택 ===")
+    print("1. speed: 2개 워커 + GPU 메모리 (최고 속도)")
+    print("2. balanced: 3개 워커 + GPU/CPU 메모리 혼합 (균형)")
+    print("3. memory_safe: 5-6개 워커 + CPU 메모리 (안전)")
+    
+    # 성능 모드별 트레이너 생성
+    performance_modes = ["speed", "balanced", "memory_safe"]
+    
+    print(f"\n권장: 16 vCPU 환경에서는 'speed' 모드 추천 (GPU 연산 최대 활용)")
+    
+    # 기본적으로 speed 모드 사용 (가장 빠른 성능)
+    selected_mode = "speed"
+    print(f"선택된 모드: {selected_mode}")
+    
     # 병렬 트레이너 생성 및 실행
     trainer = ParallelTrainer(
-        num_workers=6,  # 테스트를 위해 워커 수 줄임
-        episodes_per_worker=50  # 테스트를 위해 에피소드 수 줄임
+        num_workers=8,  # 성능 모드에 따라 자동 설정
+        episodes_per_worker=600,  # 워커 수가 적으므로 에피소드 수 증가
+        performance_mode=selected_mode
     )
     
     trainer.train()

@@ -7,6 +7,7 @@ import numpy as np
 from pathlib import Path
 from collections import deque
 import random, datetime, time, os
+import multiprocessing as mp
 
 # Gym은 강화학습을 위한 OpenAI 툴킷입니다.
 import gym
@@ -20,7 +21,7 @@ from nes_py.wrappers import JoypadSpace
 import gym_super_mario_bros
 
 from tensordict import TensorDict
-from torchrl.data import TensorDictReplayBuffer, LazyMemmapStorage
+from torchrl.data import TensorDictReplayBuffer, LazyMemmapStorage, LazyTensorStorage
 from tqdm import tqdm
 
 import matplotlib.pyplot as plt
@@ -87,10 +88,11 @@ class ResizeObservation(gym.ObservationWrapper):
         return observation
 
 class Mario:
-    def __init__(self, state_dim, action_dim, save_dir):
+    def __init__(self, state_dim, action_dim, save_dir, performance_mode="balanced"):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.save_dir = save_dir
+        self.performance_mode = performance_mode  # 성능 모드 저장
 
         if torch.cuda.is_available():
             self.device = "cuda"
@@ -108,7 +110,14 @@ class Mario:
         self.exploration_rate_min = 0.1
         self.curr_step = 0
 
-        self.save_every = 5e5  # Mario Net 저장 사이의 경험 횟수
+        self.save_every = 5e4  # Mario Net 저장 사이의 경험 횟수
+        
+        # info와 ep_rewards 초기화
+        self.info = {}
+        self.ep_rewards = []
+
+        # 배치 사이즈를 GPU 메모리에 맞게 증가
+        self.batch_size = 128  # 32에서 128로 증가
 
     def act(self, state):
         """
@@ -140,10 +149,86 @@ class Mario:
         return action_idx
 
 class Mario(Mario):  # 연속성을 위한 하위 클래스입니다.
-    def __init__(self, state_dim, action_dim, save_dir):
-        super().__init__(state_dim, action_dim, save_dir)
-        self.memory = TensorDictReplayBuffer(storage=LazyMemmapStorage(50000, device=torch.device("cpu")))
-        self.batch_size = 32
+    def __init__(self, state_dim, action_dim, save_dir, performance_mode="balanced"):
+        super().__init__(state_dim, action_dim, save_dir, performance_mode)
+        
+        # 성능 모드에 따른 메모리 버퍼 설정
+        current_process = mp.current_process()
+        is_worker = current_process.name != 'MainProcess'
+        
+        if is_worker:
+            # 워커 프로세스에서 성능 모드에 따른 메모리 버퍼 선택
+            if performance_mode == "speed":
+                # 속도 우선: GPU 메모리 버퍼 시도
+                try:
+                    if self.device == "cuda":
+                        self.memory = TensorDictReplayBuffer(
+                            storage=LazyTensorStorage(50000, device=self.device)
+                        )
+                        print(f"워커 {current_process.name}: 속도 우선 - GPU 메모리 버퍼 사용")
+                    else:
+                        raise RuntimeError("CUDA 없음")
+                except Exception as e:
+                    print(f"워커 {current_process.name}: GPU 메모리 버퍼 실패 ({e}), CPU 메모리 버퍼 사용")
+                    self.memory = TensorDictReplayBuffer(
+                        storage=LazyMemmapStorage(50000, device=torch.device("cpu"))
+                    )
+                    if self.device in ["cuda", "mps"]:
+                        self.memory.append_transform(lambda x: x.to(self.device))
+                        
+            elif performance_mode == "memory_safe":
+                # 메모리 안전: 항상 CPU 메모리 버퍼
+                print(f"워커 {current_process.name}: 메모리 안전 - CPU 메모리 버퍼 강제 사용")
+                self.memory = TensorDictReplayBuffer(
+                    storage=LazyMemmapStorage(50000, device=torch.device("cpu"))
+                )
+                if self.device in ["cuda", "mps"]:
+                    self.memory.append_transform(lambda x: x.to(self.device))
+                    
+            else:  # balanced
+                # 균형 모드: GPU 메모리 시도 후 실패 시 CPU 메모리
+                try:
+                    if self.device == "cuda":
+                        # 작은 메모리 버퍼로 시작 (30000 -> 25000)
+                        self.memory = TensorDictReplayBuffer(
+                            storage=LazyTensorStorage(25000, device=self.device)
+                        )
+                        print(f"워커 {current_process.name}: 균형 모드 - 작은 GPU 메모리 버퍼 사용")
+                    else:
+                        raise RuntimeError("CUDA 없음")
+                except Exception as e:
+                    print(f"워커 {current_process.name}: GPU 메모리 버퍼 실패 ({e}), CPU 메모리 버퍼 사용")
+                    self.memory = TensorDictReplayBuffer(
+                        storage=LazyMemmapStorage(50000, device=torch.device("cpu"))
+                    )
+                    if self.device in ["cuda", "mps"]:
+                        self.memory.append_transform(lambda x: x.to(self.device))
+        else:
+            # 메인 프로세스에서는 기존 로직 사용
+            if self.device == "mps":
+                # MPS는 통합 메모리이므로 CPU 메모리 버퍼 사용 (데이터 이동 불필요)
+                self.memory = TensorDictReplayBuffer(
+                    storage=LazyMemmapStorage(50000, device=torch.device("cpu"))
+                )
+                print(f"MPS 통합 메모리 사용: CPU 메모리 버퍼 (데이터 이동 없음)")
+            else:
+                # CUDA 또는 CPU의 경우 기존 로직 사용
+                try:
+                    # LazyTensorStorage 사용 시도 (CUDA의 경우)
+                    self.memory = TensorDictReplayBuffer(
+                        storage=LazyTensorStorage(50000, device=self.device)
+                    )
+                    print(f"GPU 메모리 버퍼 사용: {self.device}")
+                except (ImportError, AttributeError, RuntimeError) as e:
+                    print(f"GPU 메모리 버퍼 사용 실패 ({e}), CPU 메모리 버퍼 + transform 사용")
+                    # LazyTensorStorage가 없거나 오류 발생 시 기존 방식 + transform 사용
+                    self.memory = TensorDictReplayBuffer(
+                        storage=LazyMemmapStorage(50000, device=torch.device("cpu"))
+                    )
+                    # CUDA의 경우에만 GPU로 데이터 이동하는 transform 추가
+                    if self.device == "cuda":
+                        self.memory.append_transform(lambda x: x.to(self.device))
+        
         self.prev_info = None
 
     def cache(self, state, next_state, action, reward, done, info):
@@ -158,21 +243,35 @@ class Mario(Mario):  # 연속성을 위한 하위 클래스입니다.
         done(``bool``))
         """
 
+        # info를 self.info로 업데이트
+        self.info = info.copy()
+        
         # 리워드 계산
         reward = self.calculate_reward(reward, info, done, self.prev_info)
         self.prev_info = info.copy()
         
-        # 기존 캐시 로직
+        # 기존 캐시 로직 - GPU에서 직접 텐서 생성
         def first_if_tuple(x):
             return x[0] if isinstance(x, tuple) else x
-        state = first_if_tuple(state).__array__()
-        next_state = first_if_tuple(next_state).__array__()
+        
+        # numpy 배열 변환을 최소화하고 직접 GPU 텐서로 생성
+        state_array = first_if_tuple(state).__array__()
+        next_state_array = first_if_tuple(next_state).__array__()
 
-        state = torch.tensor(state, dtype=torch.float32)
-        next_state = torch.tensor(next_state, dtype=torch.float32)
-        action = torch.tensor([action], dtype=torch.int64)
-        reward = torch.tensor([reward], dtype=torch.float32)
-        done = torch.tensor([done])
+        if self.device == "mps":
+            # MPS는 통합 메모리이므로 CPU에서 텐서 생성 (자동으로 MPS에서 접근 가능)
+            state = torch.tensor(state_array, dtype=torch.float32)
+            next_state = torch.tensor(next_state_array, dtype=torch.float32)
+            action = torch.tensor([action], dtype=torch.int64)
+            reward = torch.tensor([reward], dtype=torch.float32)
+            done = torch.tensor([done])
+        else:
+            # CUDA 또는 CPU의 경우 해당 디바이스에서 직접 텐서 생성
+            state = torch.tensor(state_array, dtype=torch.float32, device=self.device)
+            next_state = torch.tensor(next_state_array, dtype=torch.float32, device=self.device)
+            action = torch.tensor([action], dtype=torch.int64, device=self.device)
+            reward = torch.tensor([reward], dtype=torch.float32, device=self.device)
+            done = torch.tensor([done], device=self.device)
 
         # self.memory.append((state, next_state, action, reward, done,))
         self.memory.add(TensorDict({"state": state, "next_state": next_state, "action": action, "reward": reward, "done": done}, batch_size=[]))
@@ -181,7 +280,12 @@ class Mario(Mario):  # 연속성을 위한 하위 클래스입니다.
         """
         메모리에서 일련의 경험들을 검색합니다.
         """
-        batch = self.memory.sample(self.batch_size).to(self.device)
+        # 배치 데이터를 미리 GPU로 로드
+        if self.device == "cuda":
+            batch = self.memory.sample(self.batch_size).to(self.device, non_blocking=True)
+        else:
+            batch = self.memory.sample(self.batch_size)
+        
         state, next_state, action, reward, done = (batch.get(key) for key in ("state", "next_state", "action", "reward", "done"))
         return state, next_state, action.squeeze(), reward.squeeze(), done.squeeze()
 
@@ -232,8 +336,8 @@ class MarioNet(nn.Module):
         )
 
 class Mario(Mario):
-    def __init__(self, state_dim, action_dim, save_dir):
-        super().__init__(state_dim, action_dim, save_dir)
+    def __init__(self, state_dim, action_dim, save_dir, performance_mode="balanced"):
+        super().__init__(state_dim, action_dim, save_dir, performance_mode)
         self.gamma = 0.9
         self.reward_scale = 0.1  # 보상 스케일링 파라미터
         self.q_scale = 1.0      # Q값 스케일링 파라미터
@@ -320,8 +424,8 @@ class Mario(Mario):
         return td_target
 
 class Mario(Mario):
-    def __init__(self, state_dim, action_dim, save_dir):
-        super().__init__(state_dim, action_dim, save_dir)
+    def __init__(self, state_dim, action_dim, save_dir, performance_mode="balanced"):
+        super().__init__(state_dim, action_dim, save_dir, performance_mode)
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=0.00025)
         self.loss_fn = torch.nn.SmoothL1Loss()
 
@@ -336,8 +440,8 @@ class Mario(Mario):
         self.net.target.load_state_dict(self.net.online.state_dict())
 
 class Mario(Mario):
-    def __init__(self, state_dim, action_dim, save_dir):
-        super().__init__(state_dim, action_dim, save_dir)
+    def __init__(self, state_dim, action_dim, save_dir, performance_mode="balanced"):
+        super().__init__(state_dim, action_dim, save_dir, performance_mode)
         self.best_reward = float('-inf')
         self.success_count = 0
         self.save_conditions = {
@@ -347,7 +451,13 @@ class Mario(Mario):
         }
     
     def save(self):
-        current_reward = np.mean(self.ep_rewards[-10:])
+        # ep_rewards가 비어있지 않을 때만 평균 계산
+        if len(self.ep_rewards) >= 10:
+            current_reward = np.mean(self.ep_rewards[-10:])
+        elif len(self.ep_rewards) > 0:
+            current_reward = np.mean(self.ep_rewards)
+        else:
+            current_reward = float('-inf')
         
         # 성능 기반 저장
         if current_reward > self.best_reward:
@@ -355,7 +465,7 @@ class Mario(Mario):
             self.save_conditions['performance'] = True
         
         # 안정성 기반 저장
-        if self.info["flag_get"]:
+        if self.info.get("flag_get", False):
             self.success_count += 1
             if self.success_count >= 5:
                 self.save_conditions['stability'] = True
@@ -379,8 +489,8 @@ class Mario(Mario):
             self.save_conditions = {k: False for k in self.save_conditions}
 
 class Mario(Mario):
-    def __init__(self, state_dim, action_dim, save_dir):
-        super().__init__(state_dim, action_dim, save_dir)
+    def __init__(self, state_dim, action_dim, save_dir, performance_mode="balanced"):
+        super().__init__(state_dim, action_dim, save_dir, performance_mode)
         self.burnin = 1e3  # 학습을 진행하기 전 최소한의 경험값. 1e4 -> 1e3 학습을 더 빠르게 시작.
         self.learn_every = 1  # Q_online 업데이트 사이의 경험 횟수. 매번 학습 3 -> 1
         self.sync_every = 1e3  # Q_target과 Q_online sync 사이의 경험 수 1e4 -> 1e3
@@ -608,7 +718,7 @@ def main():
     save_dir = Path("checkpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     save_dir.mkdir(parents=True)
 
-    mario = Mario(state_dim=(4, 84, 84), action_dim=env.action_space.n, save_dir=save_dir)
+    mario = Mario(state_dim=(4, 84, 84), action_dim=env.action_space.n, save_dir=save_dir, performance_mode="balanced")
 
     logger = MetricLogger(save_dir, model = mario.net, device = mario.device)
 
@@ -616,6 +726,7 @@ def main():
     for e in range(episodes):
 
         state = env.reset()
+        episode_reward = 0  # 에피소드 보상 추적
 
         # 게임을 실행시켜봅시다!
         while True:
@@ -625,6 +736,9 @@ def main():
 
             # 에이전트가 액션 수행하기
             next_state, reward, done, trunc, info = env.step(action)
+
+            # 에피소드 보상 누적
+            episode_reward += reward
 
             # 기억하기
             mario.cache(state, next_state, action, reward, done, info)
@@ -642,6 +756,9 @@ def main():
             if done or info["flag_get"]:
                 break
 
+        # 에피소드 보상을 mario.ep_rewards에 추가
+        mario.ep_rewards.append(episode_reward)
+        
         logger.log_episode()
 
         if (e % 5 == 0) or (e == episodes - 1):
